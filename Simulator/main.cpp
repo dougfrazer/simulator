@@ -20,6 +20,7 @@ static const int numMsPerDay = numMsPerHour * 24;
 static const int numMsPerWeek = numMsPerHour * 24;
 static const int NUM_COMMODITIES = 3;
 static int64_t s_simulationTime;
+static const int simulationHeartBeatRate = 10000;
 //----------------------------------------------------------------------
 #ifdef SIMULATOR
 static const int s_minValue = 2;
@@ -76,7 +77,7 @@ static int GetMinValue()
 static int GetTimePeriod()
 {
 #ifdef SIMULATOR
-	return numMsPerMin;
+	return numMsPerHour;
 #else
 	return s_commodityTimePeriodCvar->GetInt();
 #endif
@@ -87,6 +88,7 @@ static int GetTimePeriod()
 struct CommodityData
 {
 	int itemID;
+	int baseValue; // in copper
 };
 //----------------------------------------------------------------------
 // TODO: this is fake record data for the three commodities we're hackathoning
@@ -95,111 +97,55 @@ static CommodityData s_commodityData[NUM_COMMODITIES] =
 	// ID = 1
 	{
 		123919,
+		20000,
 	},
 	// ID = 2
 	{
 		124437,
+		20000,
 	},
 	// ID = 3
 	{
 		124113,
+		20000,
 	},
 };
 //----------------------------------------------------------------------
-enum TRANSACTION_TYPE
-{
-	TRANS_BUY,
-	TRANS_SELL,
-};
-//----------------------------------------------------------------------
 // This is an individual auction up for sale
-struct CommodityTransaction
+struct CommodityHistoryNode
 {
-	TRANSACTION_TYPE type;
-	float cpv;
-	float volatility;
 	int totalCount;
-	float totalValue;
-	int amount;
+	float volatility;
+	float costPer;
 	int64_t timestamp;
 };
 //----------------------------------------------------------------------
 // This is a container for a single commodity, containing all the auctions, and some metadata
 #ifdef SIMULATOR
-typedef std::list<CommodityTransaction> CommodityHistory;
+typedef std::list<CommodityHistoryNode> CommodityHistory;
 #else
 typedef blz::list<CommodityTransaction> CommodityHistory;
 #endif
 struct PendingCommodityData
 {
 	int itemID;
-	float currentPerUnitValue;
-	float errorBars;
-	//float volatility;
-	float totalValue;
 	int totalCount;
+	float costPer;
+	float volatility;
+
 	CommodityHistory history;
 	//----------------------------------------------------------------------
-	void AddTransaction(int64_t timestamp, TRANSACTION_TYPE type, int amount)
+	CommodityHistoryNode& Record()
 	{
-		CommodityTransaction transaction;
-		transaction.timestamp = timestamp;
-		transaction.totalValue = totalValue;
-		transaction.cpv = currentPerUnitValue;
-		transaction.totalCount = totalCount;
-		transaction.type = type;
-		transaction.amount = amount;
-		transaction.volatility = errorBars;
-		history.push_front(transaction);
+		CommodityHistoryNode historyNode;
+		historyNode.timestamp = s_simulationTime;
+		historyNode.totalCount = totalCount;
+		historyNode.volatility = volatility;
+		historyNode.costPer = costPer;
+		history.push_front(historyNode);
+		return history.front();
 	}
 	//----------------------------------------------------------------------
-	float GetRateOfInventoryChange(int numMs)
-	{
-		int stockNow = totalCount;
-		int64_t timeNow = s_simulationTime;
-		int stockTimeAgo = totalCount;
-		int64_t timeAgo = s_simulationTime;
-		bool foundEnd = false;
-		for (const auto& node : history)
-		{
-			if (s_simulationTime - numMs > node.timestamp)
-			{
-				foundEnd = true;
-				break; // only consider the time period considered
-			}
-			stockTimeAgo = node.totalCount;
-			timeAgo = node.timestamp;
-		}
-		// This is so that if you do not have sufficient data, assume constant
-		if (!foundEnd)
-		{
-			return 0.0f;
-		}
-
-		const int stockChange = stockNow - stockTimeAgo;
-		const int64_t timeChangeMs = timeNow - timeAgo;
-		const float rateOfChange = ((float)stockChange) / ((float)timeChangeMs);
-		return rateOfChange;
-	}
-	//----------------------------------------------------------------------
-	void RecalculateValue(int64_t)
-	{
-		const int timePeriod = GetTimePeriod();
-		float rateOfChange = GetRateOfInventoryChange(timePeriod);
-		
-		// the magnitude represents the amount losing per timeperiod
-		if (rateOfChange)
-		{
-			float magnitudeOfChange = rateOfChange*timePeriod;
-			float percentageOfStockChangeOverTimePeriod = magnitudeOfChange / totalCount;
-			if (percentageOfStockChangeOverTimePeriod > FLT_EPSILON)
-			{
-				errorBars = MIN(percentageOfStockChangeOverTimePeriod, 0.05f);
-
-				currentPerUnitValue = MAX(currentPerUnitValue * (1.0f - percentageOfStockChangeOverTimePeriod), GetMinValue());
-			}
-		}
-	}
 };
 //----------------------------------------------------------------------
 // this is a container for all the commodities
@@ -208,39 +154,55 @@ static PendingCommodityData s_pendingCommodities[NUM_COMMODITIES];
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 static void SimulateBuy(int listID, int count)
 {
-	int64_t prevTime = 0;
-	if (s_pendingCommodities[listID].history.size())
-	{
-		prevTime = s_pendingCommodities[listID].history.front().timestamp;
-	}
-	int toSubtract = count > s_pendingCommodities[listID].totalCount ? s_pendingCommodities[listID].totalCount : count;
-	s_pendingCommodities[listID].totalCount -= toSubtract;
-	s_pendingCommodities[listID].totalValue -= toSubtract * s_pendingCommodities[listID].currentPerUnitValue;
-
-	s_pendingCommodities[listID].AddTransaction(s_simulationTime, TRANS_BUY, count);
-
-	if (prevTime)
-	{
-		s_pendingCommodities[listID].RecalculateValue(s_simulationTime - prevTime);
-	}
+	auto& commodity = s_pendingCommodities[listID];
+	int toSubtract = count > commodity.totalCount ? commodity.totalCount : count;
+	commodity.totalCount -= toSubtract;
 }
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 static void SimulateSell(int listID, int count)
 {
-	int64_t prevTime = 0;
-	if (s_pendingCommodities[listID].history.size())
+	auto& commodity = s_pendingCommodities[listID];
+	commodity.totalCount += count;
+}
+///////////////////////////////////////////////////////////////////////////////////////////////////
+static void SimulateHeartbeat(int listID)
+{
+	auto& commodity = s_pendingCommodities[listID];
+	CommodityHistoryNode& newNode = commodity.Record();
+	const int timePeriodMs = GetTimePeriod();
+
+	// compute the rate at which we are selling our goods
+	const CommodityHistoryNode* beforeNode = nullptr;
+	for (auto& node : commodity.history)
 	{
-		prevTime = s_pendingCommodities[listID].history.front().timestamp;
+		if (s_simulationTime - timePeriodMs > node.timestamp)
+		{
+			beforeNode = &node;
+			break; // only consider the time period considered
+		}
+	}
+	if (!beforeNode)
+	{
+		// not enough data in our history, nothing to do
+		return;
 	}
 
-	s_pendingCommodities[listID].totalCount += count;
-	s_pendingCommodities[listID].totalValue += count * s_pendingCommodities[listID].currentPerUnitValue;
+	const int countChange = newNode.totalCount - beforeNode->totalCount;
+	const int64_t timeChangeMs = newNode.timestamp - beforeNode->timestamp;
+	const float rateOfChange = ((float)countChange) / ((float)timeChangeMs);
+	const float changeByNextTick = rateOfChange * simulationHeartBeatRate;
 
-	s_pendingCommodities[listID].AddTransaction(s_simulationTime, TRANS_SELL, count);
-
-	if (prevTime)
+	// compute a new price to match the demand
+	// based on how we assume it to be trending, we want to make the price aim towards the same value as it currently is
+	// so we will need to adjust prices to maintain the same value
+	if (commodity.totalCount)
 	{
-		s_pendingCommodities[listID].RecalculateValue(s_simulationTime - prevTime);
+		const float expectedCount = commodity.totalCount + changeByNextTick;
+		commodity.volatility = 1.0f - ((commodity.totalCount + rateOfChange * timePeriodMs) / commodity.totalCount);
+		const float currentValue = commodity.costPer * commodity.totalCount;
+		const float expectedValue = commodity.costPer * expectedCount;
+		const float expectedCostPer = expectedValue / commodity.totalCount;
+		commodity.costPer = expectedCostPer;
 	}
 }
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -250,29 +212,40 @@ void GlobalCommodityMarket_Simulate(const JamCommoditySimulate& params)
 	const int numBuys = params.avgBuyCount + Fast_ftolRound(rand_floats() * (params.buyCountVariance));
 	const int numTransaction = numSells + numBuys;
 	const float buyChance = (float)(numBuys) / (float)(numTransaction);
+	
 	const int numMsForPeriod = params.numDays * numMsPerDay;
-	const int numMsPerOrder = Fast_ftolRound((float)numMsForPeriod / (float)numTransaction);
-
+	const int numMsPerTransaction = Fast_ftolRound((float)numMsForPeriod / (float)numTransaction);
+	int64_t lastTransTimestamp = 0;
+	s_simulationTime = 0;
 	int currNumSells = numSells;
 	int currNumBuys = numBuys;
-
-	while (currNumSells && currNumBuys)
+	while (s_simulationTime < numMsForPeriod)
 	{
-		int stackSize = params.avgStackSize + Fast_ftolRound(rand_floats() * (params.stackSizeVariance));
-		int listID = (int)(rand_float() * NUM_COMMODITIES);
-		s_simulationTime += numMsPerOrder;
+		for (int i = 0; i < NUM_COMMODITIES; i++)
+		{
+			SimulateHeartbeat(i);
+		}
+		
+		const bool shouldProcessTransaction = (s_simulationTime - lastTransTimestamp) > numMsPerTransaction;
+		if (shouldProcessTransaction)
+		{
+			lastTransTimestamp = s_simulationTime;
+			int stackSize = params.avgStackSize + Fast_ftolRound(rand_floats() * (params.stackSizeVariance));
+			int listID = (int)(rand_float() * NUM_COMMODITIES);
 
-		// execute either a buy or a sell based on the ratio, trying to even split them up
-		if (!currNumSells || (currNumBuys && rand_float() < buyChance))
-		{
-			SimulateBuy(listID, stackSize);
-			--currNumBuys;
+			// execute either a buy or a sell based on the ratio, trying to even split them up
+			if (!currNumSells || (currNumBuys && rand_float() < buyChance))
+			{
+				SimulateBuy(listID, stackSize);
+				--currNumBuys;
+			}
+			else
+			{
+				SimulateSell(listID, stackSize);
+				--currNumSells;
+			}
 		}
-		else
-		{
-			SimulateSell(listID, stackSize);
-			--currNumSells;
-		}
+		s_simulationTime += simulationHeartBeatRate;
 	}
 }
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -280,8 +253,8 @@ void GlobalCommodityMarket_Simulate(const JamCommoditySimulate& params)
 int main()
 {
 	JamCommoditySimulate params;
-	params.avgBuyCount = 10000;
-	params.avgSellCount = 100;
+	params.avgBuyCount = 100;
+	params.avgSellCount = 1000;
 	params.avgStackSize = 10;
 	params.buyCountVariance = 0;
 	params.sellCountVariance = 0;
@@ -292,13 +265,8 @@ int main()
 
 	for (int i = 0; i < NUM_COMMODITIES; i++)
 	{
-		const int costPerUnit = 10 * 10000;
-		const int numUnits = 10000;
-		s_pendingCommodities[i].itemID = s_commodityData[i].itemID;
-		s_pendingCommodities[i].totalCount = numUnits;
-		s_pendingCommodities[i].totalValue = costPerUnit * numUnits;
-		s_pendingCommodities[i].errorBars = 0.0f;
-		s_pendingCommodities[i].currentPerUnitValue = costPerUnit;
+		s_pendingCommodities[i].costPer = s_commodityData[i].baseValue;
+		s_pendingCommodities[i].totalCount = 10000;
 	}
 
 	GlobalCommodityMarket_Simulate(params);
