@@ -1,144 +1,309 @@
-#include <cstdlib>
+//#include "pch.h"
+
+#define SIMULATOR 1
+
+#ifdef SIMULATOR
+#include <cstdint>
 #include <time.h>
 #include <list>
-#include <cstdint>
+#else
+#include "GlobalCommodityMarket.h"
+#include "JamSharedAutoCode/JamMiscStruct.h"
+#include "Tempest/crandom.h"
+#endif
 
-static float rand_floats(){ return (((float)rand() / (float)RAND_MAX) * 2.0f) - 1.0f; }
-static float rand_float() { return (((float)rand() / (float)RAND_MAX)); }
-
+//----------------------------------------------------------------------
 static const int numMsPerSec = 1000;
 static const int numMsPerMin = numMsPerSec * 60;
 static const int numMsPerHour = numMsPerMin * 60;
 static const int numMsPerDay = numMsPerHour * 24;
 static const int numMsPerWeek = numMsPerHour * 24;
-
-static int64_t s_simulationTime = 0;
-
-///////////////////////////////////////////////////////////////////////////////////////////////////
-static const int s_setup_avgSellCount          = 50;
-static const int s_setup_avgBuyCount           = 5;
-static const int s_setup_avgStackCount         = 20;
-static const int s_setup_sellPriceVariance     = 0;
-static const int s_setup_buyPriceVariance      = 0;
-static const int s_setup_stackCountVariance    = 10;
-static const int s_setup_numDays               = 1;
-///////////////////////////////////////////////////////////////////////////////////////////////////
+static const int NUM_COMMODITIES = 3;
+static int64_t s_simulationTime;
+//----------------------------------------------------------------------
+#ifdef SIMULATOR
+static const int s_minValue = 2;
+#define MAX(a,b) (a > b ? a : b)
+#define MIN(a,b) (a < b ? a : b)
+int Fast_ftolRound(float in)
+{
+	return (int)in;
+}
+struct JamCommoditySimulate
+{
+public:
+	int numDays;
+	int avgSellCount;
+	int avgBuyCount;
+	int avgStackSize;
+	int sellCountVariance;
+	int buyCountVariance;
+	int stackSizeVariance;
+};
+#else
+static CRndSeed s_rndSeed;
+static CVar* s_cantGoBelowCvar;
+static CVar* s_commodityTimePeriodCvar;
+#endif
+//----------------------------------------------------------------------
+static float rand_floats()
+{
+#ifdef SIMULATOR
+	return (((float)rand() / (float)RAND_MAX) * 2.0f) - 1.0f;
+#else
+	return CRandom::floats_(s_rndSeed);
+#endif
+}
+//----------------------------------------------------------------------
+static float rand_float()
+{
+#ifdef SIMULATOR
+	return (((float)rand() / (float)RAND_MAX));
+#else
+	return CRandom::float_(s_rndSeed);
+#endif
+}
+//----------------------------------------------------------------------
+static int GetMinValue()
+{
+#ifdef SIMULATOR
+	return s_minValue;
+#else
+	return s_cantGoBelowCvar->GetInt();
+#endif
+}
+//----------------------------------------------------------------------
+static int GetTimePeriod()
+{
+#ifdef SIMULATOR
+	return numMsPerMin;
+#else
+	return s_commodityTimePeriodCvar->GetInt();
+#endif
+}
+//----------------------------------------------------------------------
+// TODO: this is effectively a fake record format where we will describe
+//       parameters of each commodity and how it should change over time
+struct CommodityData
+{
+	int itemID;
+};
+//----------------------------------------------------------------------
+// TODO: this is fake record data for the three commodities we're hackathoning
+static CommodityData s_commodityData[NUM_COMMODITIES] =
+{
+	// ID = 1
+	{
+		123919,
+	},
+	// ID = 2
+	{
+		124437,
+	},
+	// ID = 3
+	{
+		124113,
+	},
+};
+//----------------------------------------------------------------------
 enum TRANSACTION_TYPE
 {
 	TRANS_BUY,
 	TRANS_SELL,
 };
-///////////////////////////////////////////////////////////////////////////////////////////////////
+//----------------------------------------------------------------------
+// This is an individual auction up for sale
 struct CommodityTransaction
 {
-	int64_t totalValue;
-	float cpv;
 	TRANSACTION_TYPE type;
+	float cpv;
+	float volatility;
+	int totalCount;
+	float totalValue;
 	int amount;
 	int64_t timestamp;
 };
-///////////////////////////////////////////////////////////////////////////////////////////////////
-struct CommodityData
+//----------------------------------------------------------------------
+// This is a container for a single commodity, containing all the auctions, and some metadata
+#ifdef SIMULATOR
+typedef std::list<CommodityTransaction> CommodityHistory;
+#else
+typedef blz::list<CommodityTransaction> CommodityHistory;
+#endif
+struct PendingCommodityData
 {
-	int totalValue;
-	int totalCount;
+	int itemID;
 	float currentPerUnitValue;
-	void RecalculateValue();
-	void AddTransaction(int64_t timestamp, TRANSACTION_TYPE type, int amount);
-	std::list<CommodityTransaction> history;
-private:
-	int GetAvgTotalValue(int numMs);
-};
-///////////////////////////////////////////////////////////////////////////////////////////////////
-static CommodityData s_commodityData;
-///////////////////////////////////////////////////////////////////////////////////////////////////
-void CommodityData::AddTransaction(int64_t timestamp, TRANSACTION_TYPE type, int amount)
-{
-	CommodityTransaction transaction;
-	transaction.timestamp = timestamp;
-	transaction.totalValue = s_commodityData.totalValue;
-	transaction.cpv = s_commodityData.currentPerUnitValue;
-	transaction.type = type;
-	transaction.amount = amount;
-	s_commodityData.history.push_front(transaction);
-}
-///////////////////////////////////////////////////////////////////////////////////////////////////
-int CommodityData::GetAvgTotalValue(int numMs)
-{
-	int64_t value = totalValue;
-	int count = 1;
-	for (auto& node : s_commodityData.history)
+	float errorBars;
+	//float volatility;
+	float totalValue;
+	int totalCount;
+	CommodityHistory history;
+	//----------------------------------------------------------------------
+	void AddTransaction(int64_t timestamp, TRANSACTION_TYPE type, int amount)
 	{
-		if (s_simulationTime - numMs > node.timestamp)
-		{
-			break; // only consider the past day
-		}
-		value += node.totalValue;
-		++count;
+		CommodityTransaction transaction;
+		transaction.timestamp = timestamp;
+		transaction.totalValue = totalValue;
+		transaction.cpv = currentPerUnitValue;
+		transaction.totalCount = totalCount;
+		transaction.type = type;
+		transaction.amount = amount;
+		transaction.volatility = errorBars;
+		history.push_front(transaction);
 	}
-	return value / count;
-}
-///////////////////////////////////////////////////////////////////////////////////////////////////
-void CommodityData::RecalculateValue()
-{
-	int avgTotalValueForPastDay = GetAvgTotalValue(numMsPerDay);
-	currentPerUnitValue = (float)avgTotalValueForPastDay / (float)totalCount;
-}
-///////////////////////////////////////////////////////////////////////////////////////////////////
-static void SimulateBuy(int count)
-{
-	int toSubtract = count > s_commodityData.totalCount ? s_commodityData.totalCount : count;
-	s_commodityData.totalCount -= toSubtract;
-	s_commodityData.totalValue -= toSubtract * s_commodityData.currentPerUnitValue;
-
-	s_commodityData.AddTransaction(s_simulationTime, TRANS_BUY, count);
-
-	s_commodityData.RecalculateValue();
-}
-///////////////////////////////////////////////////////////////////////////////////////////////////
-static void SimulateSell(int count)
-{
-	s_commodityData.totalCount += count;
-	s_commodityData.totalValue += count * s_commodityData.currentPerUnitValue;
-
-	s_commodityData.AddTransaction(s_simulationTime, TRANS_SELL, count);
-
-	s_commodityData.RecalculateValue();
-}
-///////////////////////////////////////////////////////////////////////////////////////////////////
-int main()
-{
-	srand(time(NULL));
-
-	s_commodityData.totalCount = 1000;
-	s_commodityData.currentPerUnitValue = 10;
-	s_commodityData.totalValue = s_commodityData.totalCount * s_commodityData.currentPerUnitValue;
-	s_simulationTime = 0;
-
-	const int numBuys = s_setup_avgBuyCount + rand_floats() * s_setup_buyPriceVariance;
-	const int numSells = s_setup_avgSellCount + rand_floats() * s_setup_sellPriceVariance;
-	const int totalExchanges = numBuys + numSells;
-	const float buyChance = (float)(numBuys) / (float)(totalExchanges);
-	
-	const int numMsTotal = numMsPerDay * s_setup_numDays;
-	const int numMsPerTrade = (int)((float)numMsTotal / (float)totalExchanges);
-
-	int currNumBuys = numBuys;
-	int currNumSells = numSells;
-
-	while (currNumBuys || currNumSells)
+	//----------------------------------------------------------------------
+	float GetRateOfInventoryChange(int numMs)
 	{
-		s_simulationTime += numMsPerTrade;
-		const int count = s_setup_avgStackCount + rand_floats() * s_setup_stackCountVariance;
+		int stockNow = totalCount;
+		int64_t timeNow = s_simulationTime;
+		int stockTimeAgo = totalCount;
+		int64_t timeAgo = s_simulationTime;
+		bool foundEnd = false;
+		for (const auto& node : history)
+		{
+			if (s_simulationTime - numMs > node.timestamp)
+			{
+				foundEnd = true;
+				break; // only consider the time period considered
+			}
+			stockTimeAgo = node.totalCount;
+			timeAgo = node.timestamp;
+		}
+		// This is so that if you do not have sufficient data, assume constant
+		if (!foundEnd)
+		{
+			return 0.0f;
+		}
+
+		const int stockChange = stockNow - stockTimeAgo;
+		const int64_t timeChangeMs = timeNow - timeAgo;
+		const float rateOfChange = ((float)stockChange) / ((float)timeChangeMs);
+		return rateOfChange;
+	}
+	//----------------------------------------------------------------------
+	void RecalculateValue(int64_t)
+	{
+		const int timePeriod = GetTimePeriod();
+		float rateOfChange = GetRateOfInventoryChange(timePeriod);
+		
+		// the magnitude represents the amount losing per timeperiod
+		if (rateOfChange)
+		{
+			float magnitudeOfChange = rateOfChange*timePeriod;
+			float percentageOfStockChangeOverTimePeriod = magnitudeOfChange / totalCount;
+			if (percentageOfStockChangeOverTimePeriod > FLT_EPSILON)
+			{
+				errorBars = MIN(percentageOfStockChangeOverTimePeriod, 0.05f);
+
+				currentPerUnitValue = MAX(currentPerUnitValue * (1.0f - percentageOfStockChangeOverTimePeriod), GetMinValue());
+			}
+		}
+	}
+};
+//----------------------------------------------------------------------
+// this is a container for all the commodities
+static PendingCommodityData s_pendingCommodities[NUM_COMMODITIES];
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+static void SimulateBuy(int listID, int count)
+{
+	int64_t prevTime = 0;
+	if (s_pendingCommodities[listID].history.size())
+	{
+		prevTime = s_pendingCommodities[listID].history.front().timestamp;
+	}
+	int toSubtract = count > s_pendingCommodities[listID].totalCount ? s_pendingCommodities[listID].totalCount : count;
+	s_pendingCommodities[listID].totalCount -= toSubtract;
+	s_pendingCommodities[listID].totalValue -= toSubtract * s_pendingCommodities[listID].currentPerUnitValue;
+
+	s_pendingCommodities[listID].AddTransaction(s_simulationTime, TRANS_BUY, count);
+
+	if (prevTime)
+	{
+		s_pendingCommodities[listID].RecalculateValue(s_simulationTime - prevTime);
+	}
+}
+///////////////////////////////////////////////////////////////////////////////////////////////////
+static void SimulateSell(int listID, int count)
+{
+	int64_t prevTime = 0;
+	if (s_pendingCommodities[listID].history.size())
+	{
+		prevTime = s_pendingCommodities[listID].history.front().timestamp;
+	}
+
+	s_pendingCommodities[listID].totalCount += count;
+	s_pendingCommodities[listID].totalValue += count * s_pendingCommodities[listID].currentPerUnitValue;
+
+	s_pendingCommodities[listID].AddTransaction(s_simulationTime, TRANS_SELL, count);
+
+	if (prevTime)
+	{
+		s_pendingCommodities[listID].RecalculateValue(s_simulationTime - prevTime);
+	}
+}
+///////////////////////////////////////////////////////////////////////////////////////////////////
+void GlobalCommodityMarket_Simulate(const JamCommoditySimulate& params)
+{
+	const int numSells = params.avgSellCount + Fast_ftolRound(rand_floats() * (params.sellCountVariance));
+	const int numBuys = params.avgBuyCount + Fast_ftolRound(rand_floats() * (params.buyCountVariance));
+	const int numTransaction = numSells + numBuys;
+	const float buyChance = (float)(numBuys) / (float)(numTransaction);
+	const int numMsForPeriod = params.numDays * numMsPerDay;
+	const int numMsPerOrder = Fast_ftolRound((float)numMsForPeriod / (float)numTransaction);
+
+	int currNumSells = numSells;
+	int currNumBuys = numBuys;
+
+	while (currNumSells && currNumBuys)
+	{
+		int stackSize = params.avgStackSize + Fast_ftolRound(rand_floats() * (params.stackSizeVariance));
+		int listID = (int)(rand_float() * NUM_COMMODITIES);
+		s_simulationTime += numMsPerOrder;
+
+		// execute either a buy or a sell based on the ratio, trying to even split them up
 		if (!currNumSells || (currNumBuys && rand_float() < buyChance))
 		{
-			SimulateBuy(count);
+			SimulateBuy(listID, stackSize);
 			--currNumBuys;
 		}
 		else
 		{
-			SimulateSell(count);
+			SimulateSell(listID, stackSize);
 			--currNumSells;
 		}
 	}
 }
+///////////////////////////////////////////////////////////////////////////////////////////////////
+#ifdef SIMULATOR
+int main()
+{
+	JamCommoditySimulate params;
+	params.avgBuyCount = 10000;
+	params.avgSellCount = 100;
+	params.avgStackSize = 10;
+	params.buyCountVariance = 0;
+	params.sellCountVariance = 0;
+	params.stackSizeVariance = 0;
+	params.numDays = 1;
+
+	s_simulationTime = time(NULL);
+
+	for (int i = 0; i < NUM_COMMODITIES; i++)
+	{
+		const int costPerUnit = 10 * 10000;
+		const int numUnits = 10000;
+		s_pendingCommodities[i].itemID = s_commodityData[i].itemID;
+		s_pendingCommodities[i].totalCount = numUnits;
+		s_pendingCommodities[i].totalValue = costPerUnit * numUnits;
+		s_pendingCommodities[i].errorBars = 0.0f;
+		s_pendingCommodities[i].currentPerUnitValue = costPerUnit;
+	}
+
+	GlobalCommodityMarket_Simulate(params);
+}
+#endif
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+
